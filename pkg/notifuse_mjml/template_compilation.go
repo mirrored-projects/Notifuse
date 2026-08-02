@@ -432,11 +432,6 @@ func CompileTemplate(req CompileTemplateRequest) (resp *CompileTemplateResponse,
 	if req.MjmlSource != nil && *req.MjmlSource != "" {
 		mjmlString = *req.MjmlSource
 
-		// Apply subject_preview override in MJML source before Liquid processing
-		if req.SubjectPreviewOverride != nil && *req.SubjectPreviewOverride != "" {
-			mjmlString = overrideMjPreviewInSource(mjmlString, *req.SubjectPreviewOverride)
-		}
-
 		// Process Liquid templates if template data is provided and PreserveLiquid is false
 		if !req.PreserveLiquid && len(req.TemplateData) > 0 {
 			processed, err := ProcessLiquidTemplate(mjmlString, req.TemplateData, "mjml-source")
@@ -451,6 +446,26 @@ func CompileTemplate(req CompileTemplateRequest) (resp *CompileTemplateResponse,
 				}, nil
 			}
 			mjmlString = processed
+		}
+
+		// Apply the subject_preview override after Liquid, so the escaping applies to
+		// the rendered value rather than to the Liquid syntax. Escaping first would
+		// leave the rendered value unescaped (a bare & fails the XML parse) and would
+		// corrupt comparisons like {% if a > b %} by entity-encoding the operator.
+		// Unconditional, unlike the visual-mode fallback below: code mode has no tree
+		// pass to place the override, so it must also replace an existing mj-preview,
+		// which overrideMjPreviewInSource does.
+		if req.SubjectPreviewOverride != nil && *req.SubjectPreviewOverride != "" {
+			renderedOverride, overrideErr := renderSubjectField(req.SubjectPreviewOverride, req.TemplateData, req.Channel, req.PreserveLiquid, "email_subject_preview_override")
+			if overrideErr != nil {
+				return &CompileTemplateResponse{
+					Success:        false,
+					Subject:        renderedSubject,
+					SubjectPreview: renderedSubjectPreview,
+					Error:          overrideErr,
+				}, nil
+			}
+			mjmlString = overrideMjPreviewInSource(mjmlString, *renderedOverride)
 		}
 	} else {
 		// Visual editor mode: convert JSON tree to MJML
@@ -531,9 +546,28 @@ func CompileTemplate(req CompileTemplateRequest) (resp *CompileTemplateResponse,
 
 	// For visual editor mode: if subject_preview override was requested but the tree
 	// didn't contain an mj-preview block, fall back to injecting it in the MJML string.
+	// The preview text is Liquid-rendered first, mirroring the per-block rendering an
+	// mj-preview block in the tree receives: the whole-string pass above has already
+	// run, so rendering here (rather than injecting raw Liquid) is what gets the
+	// expression evaluated exactly once, and XML-escaping applies to the rendered
+	// value instead of the Liquid syntax.
+	// The condition tests for a *paired* tag on purpose: that is the signal the tree
+	// walk already placed the override in a real mj-preview block. A self-closing
+	// <mj-preview /> means it did not — an mj-liquid block can emit a bare tag the
+	// walk never sees — so it falls through here and overrideMjPreviewInSource fills
+	// it rather than injecting a second element.
 	if req.MjmlSource == nil && req.SubjectPreviewOverride != nil && *req.SubjectPreviewOverride != "" {
 		if !mjPreviewTagRegexp.MatchString(mjmlString) {
-			mjmlString = overrideMjPreviewInSource(mjmlString, *req.SubjectPreviewOverride)
+			renderedOverride, overrideErr := renderSubjectField(req.SubjectPreviewOverride, req.TemplateData, req.Channel, req.PreserveLiquid, "email_subject_preview_override")
+			if overrideErr != nil {
+				return &CompileTemplateResponse{
+					Success:        false,
+					Subject:        renderedSubject,
+					SubjectPreview: renderedSubjectPreview,
+					Error:          overrideErr,
+				}, nil
+			}
+			mjmlString = overrideMjPreviewInSource(mjmlString, *renderedOverride)
 		}
 	}
 
@@ -705,8 +739,14 @@ func TrackLinks(htmlString string, trackingSettings TrackingSettings) (updatedHT
 	return updatedHTML, nil
 }
 
-// mjPreviewTagRegexp matches <mj-preview>...</mj-preview> in MJML source.
-var mjPreviewTagRegexp = regexp.MustCompile(`(?is)(<mj-preview\s*>)([\s\S]*?)(</mj-preview\s*>)`)
+// mjPreviewTagRegexp matches a paired <mj-preview ...>...</mj-preview> in MJML
+// source, including one carrying attributes. The [^>]* cannot cross the tag
+// boundary, so content such as <br/> never confuses the match.
+var mjPreviewTagRegexp = regexp.MustCompile(`(?is)(<mj-preview\b[^>]*>)([\s\S]*?)(</mj-preview\s*>)`)
+
+// mjPreviewSelfClosingTagRegexp matches a self-closing <mj-preview ... />, the
+// form the converter emits for an mj-preview block with no content.
+var mjPreviewSelfClosingTagRegexp = regexp.MustCompile(`(?is)(<mj-preview\b[^>]*?)\s*/>`)
 
 // mjHeadTagRegexp matches the opening <mj-head...> tag.
 var mjHeadTagRegexp = regexp.MustCompile(`(?i)<mj-head[^>]*>`)
@@ -719,6 +759,13 @@ var mjmlRootTagRegexp = regexp.MustCompile(`(?i)<mjml[^>]*>`)
 // Fallback order: replace existing → inject after <mj-head> → create <mj-head> after <mjml>.
 func overrideMjPreviewInSource(mjmlSource string, previewText string) string {
 	escaped := escapeXMLContent(previewText)
+
+	// Expand a self-closing <mj-preview /> into a paired tag holding the text,
+	// keeping any attributes it carried.
+	if mjPreviewSelfClosingTagRegexp.MatchString(mjmlSource) {
+		return mjPreviewSelfClosingTagRegexp.ReplaceAllString(mjmlSource,
+			"${1}>"+escapeRegexpReplacement(escaped)+"</mj-preview>")
+	}
 
 	// Replace existing <mj-preview> content
 	if mjPreviewTagRegexp.MatchString(mjmlSource) {
@@ -742,11 +789,15 @@ func overrideMjPreviewInSource(mjmlSource string, previewText string) string {
 	return mjmlSource
 }
 
-// escapeXMLContent escapes &, <, > for safe insertion as XML element text content.
+// escapeXMLContent escapes &, <, > for safe insertion as XML element text
+// content. Angle brackets use numeric character references (&#60;/&#62;) rather
+// than &lt;/&gt; because the MJML parser pre-decodes the named entities back to
+// raw brackets before XML parsing, which would turn escaped text into markup
+// and fail the compile; numeric references survive that pre-decode untouched.
 func escapeXMLContent(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "<", "&#60;")
+	s = strings.ReplaceAll(s, ">", "&#62;")
 	return s
 }
 
