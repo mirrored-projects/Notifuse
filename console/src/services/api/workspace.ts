@@ -195,6 +195,7 @@ export interface OpenAISettings {
   encrypted_api_key?: string
   model: string
   base_url?: string
+  reasoning_effort?: string // '', none, minimal, low, medium, high, xhigh
 }
 
 export interface GeminiSettings {

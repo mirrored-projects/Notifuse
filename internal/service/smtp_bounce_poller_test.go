@@ -81,6 +81,10 @@ func (m *mockWebhookService) ProcessWebhook(ctx context.Context, workspaceID, in
 	return m.err
 }
 
+func (m *mockWebhookService) ProcessInboundReply(ctx context.Context, workspaceID, integrationID string, req *domain.InboundRequest) error {
+	return nil
+}
+
 func (m *mockWebhookService) ListEvents(ctx context.Context, workspaceID string, params domain.InboundWebhookEventListParams) (*domain.InboundWebhookEventListResult, error) {
 	return nil, m.listErr
 }
@@ -152,6 +156,12 @@ func (m *mockBounceWorkspaceRepo) GetWorkspaceInvitations(ctx context.Context, w
 func (m *mockBounceWorkspaceRepo) DeleteInvitation(ctx context.Context, id string) error { return nil }
 func (m *mockBounceWorkspaceRepo) IsUserWorkspaceMember(ctx context.Context, userID, workspaceID string) (bool, error) {
 	return false, nil
+}
+func (m *mockBounceWorkspaceRepo) CountWorkspaceMembersAndInvitations(ctx context.Context, workspaceID string) (int, error) {
+	return 0, nil
+}
+func (m *mockBounceWorkspaceRepo) CountWorkspaces(ctx context.Context) (int, error) {
+	return len(m.workspaces), nil
 }
 func (m *mockBounceWorkspaceRepo) GetConnection(ctx context.Context, workspaceID string) (*sql.DB, error) {
 	return nil, nil
